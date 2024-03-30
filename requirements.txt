@@ -1,0 +1,5 @@
+tk
+chess
+Pillow
+pandas
+Wand
