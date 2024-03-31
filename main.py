@@ -138,23 +138,41 @@ class ChessGUI:
                 if self.board.is_check():
                     messagebox.showinfo("Check", "Check!")
 
-                # Record the move
                 self.moves_data.append({
                     'fen_before_move': self.board.fen(),
                     'move': move.uci(),
-                    'label': ''  # Label will be assigned later
+                    'label': ''
                 })
+
+                # Only make an AI move if it's AI's turn and not in training mode
+                if not self.is_training_mode and not self.board.turn:  # Adjusted logic here
+                    self.master.after(1000, self.make_ai_move)
 
             else:
                 messagebox.showerror("Invalid Move", "The move was invalid. Please try again.")
 
             if self.board.is_game_over(claim_draw=True):
                 self.game_over()
-            
-            self.save_dataset()  # Save the dataset after each move
 
         except ValueError:
             messagebox.showerror("Invalid Move", "The move was invalid. Please try again.")
+
+    def make_ai_move(self):
+        # Check if the game is over or if it's not the AI's turn (AI is black).
+        if self.board.is_game_over(claim_draw=True) or self.board.turn:
+            return  # Do nothing if the game is over or if it's not the AI's turn.
+
+        # Generate an AI move.
+        board_image = self.capture_board_state_as_image()
+        ai_move = self.get_nn_move(board_image)
+
+        # Ensure the generated move is legal and for the AI's own pieces.
+        if ai_move in self.board.legal_moves and self.board.color_at(ai_move.from_square) == chess.BLACK:
+            self.board.push(ai_move)  # Make the move on the board.
+            self.update_board()  # Update the board to reflect the move.
+        else:
+            # Log an error or handle the case where an invalid or illegal move was generated.
+            print("AI generated an invalid move or tried to move an opponent's piece.")
 
     def start_cnn_thread(self):
         threading.Thread(target=self.cnn_predict_move, daemon=True).start()
@@ -179,12 +197,23 @@ class ChessGUI:
         return move
 
     def translate_prediction_to_move(self, prediction):
+        # Get all legal moves for the AI (assuming AI is black)
+        legal_moves = [move for move in self.board.legal_moves if self.board.color_at(move.from_square) == chess.BLACK]
+
+        # If there are no legal moves, return None
+        if not legal_moves:
+            return None
+
+        # Convert the neural network's prediction to an index
         move_index = torch.argmax(prediction).item()
-        from_square_index = move_index // 64
-        to_square_index = move_index % 64
-        move_uci = chess.square_name(from_square_index) + chess.square_name(to_square_index)
-        move = chess.Move.from_uci(move_uci)
-        return move if move in self.board.legal_moves else None
+
+        # Map the prediction index to a legal move
+        # Note: This is a simplified approach; you may need a more sophisticated method
+        # to match predictions to legal moves, especially if the neural network's output
+        # does not directly correspond to specific moves.
+        selected_move = legal_moves[move_index % len(legal_moves)]  # Use modulo to ensure the index is within bounds
+
+        return selected_move
 
     def square_to_uci(self, square):
         # Convert a square index to UCI format (e.g., index 0 -> 'a1')
@@ -318,14 +347,14 @@ class ChessGUI:
 
         image = Image.open(io.BytesIO(png_image))
         photo = ImageTk.PhotoImage(image)
-        
-        self.save_board_image(png_image)  # Pass the image data for saving
+
+        self.save_board_image(png_image)
 
         self.label = tk.Label(self.plot_frame, image=photo)
         self.label.image = photo
         self.label.pack()
 
-        # Modify event binding based on training mode
+        # Bind or unbind events based on the mode
         if self.is_training_mode:
             self.label.unbind("<Button-1>")
             self.label.unbind("<B1-Motion>")
@@ -334,6 +363,10 @@ class ChessGUI:
             self.label.bind("<Button-1>", self.on_click)
             self.label.bind("<B1-Motion>", self.on_drag)
             self.label.bind("<ButtonRelease-1>", self.on_release)
+
+            # If it's AI's turn (not in training mode), make an AI move
+            if not self.board.turn:  # Assuming the AI plays as Black
+                self.master.after(1000, self.make_ai_move)
 
     def capture_board_state_as_image(self):
         # Convert the current board state to an image
@@ -448,7 +481,7 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
 
 def main():
     root = tk.Tk()
-    gui = ChessGUI(root, transform=transform)  # Pass the 'transform' variable
+    gui = ChessGUI(root, transform=transform)
     root.mainloop()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -457,7 +490,8 @@ def main():
     model = ChessCNN().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    train_model(model, device, train_loader, optimizer)
+    # Pass both train_loader and test_loader to the train_model function
+    train_model(model, device, train_loader, test_loader, optimizer)
 
     torch.save(model.state_dict(), MODEL_FILE_PATH)
     print(f'Model saved to {MODEL_FILE_PATH}')
