@@ -112,7 +112,7 @@ class ChessGUI:
         self.moves_data = []
         self.plot_frame = tk.Frame(master)
         self.plot_frame.pack()
-        self.training_button = tk.Button(master, text="Training Mode", command=self.enter_training_mode)
+        self.training_button = tk.Button(master, text="Start Training", command=self.toggle_training_mode)
         self.training_button.pack()
         self.check_dataset_availability()
         self.image_queue = queue.Queue()
@@ -123,6 +123,14 @@ class ChessGUI:
         self.load_model()
         self.update_board()  # Now safe to call as is_training_mode is initialized
         self.automated_game_thread = None  # Add this line to initialize the automated game thread
+        self.games_played = 0  # Initialize a counter to track the number of games played in automated mode
+        self.game_in_progress = False
+
+    def toggle_training_mode(self):
+        if self.is_training_mode:
+            self.exit_training_mode()
+        else:
+            self.enter_training_mode()
 
     def load_model(self):
         if os.path.exists(MODEL_FILE_PATH):
@@ -282,12 +290,13 @@ class ChessGUI:
     # Modify the enter_training_mode function
     def enter_training_mode(self):
         print("Entering training mode")
+        self.is_training_mode = True
+        self.training_button.config(text="Stop Training")
         self.board.reset()
         self.is_training_mode = True
         self.start_training_thread()  # Start training in a separate thread
-        if self.automated_game_thread is None or not self.automated_game_thread.is_alive():
-            self.automated_game_thread = threading.Thread(target=self.automated_game, daemon=True)
-            self.automated_game_thread.start()
+        self.game_in_progress = True
+        self.automated_move()  # Start the first move without waiting
 
     def automated_game(self):
         while self.is_training_mode and not self.board.is_game_over(claim_draw=True):
@@ -313,7 +322,7 @@ class ChessGUI:
 
         # Check for game over and handle accordingly
         if self.board.is_game_over(claim_draw=True):
-            self.game_over()
+            self.game_over()  # Call the modified game_over method that handles automated training mode
 
     def display_next_move_in_training(self):
         if self.current_move_index < len(self.training_data):
@@ -336,6 +345,13 @@ class ChessGUI:
         
         # Optionally, print a message or log the saving
         print(f"Board image saved to {image_path}")
+
+    def exit_training_mode(self):
+        self.is_training_mode = False
+        self.training_button.config(text="Start Training")
+        self.game_in_progress = False  # Signal to stop any automated moves
+        self.board.reset()  # Reset the board to its initial state
+        self.update_board()  # Update the board to reflect the reset state
 
     def update_board(self):
         for widget in self.plot_frame.winfo_children():
@@ -401,18 +417,60 @@ class ChessGUI:
         row = 7 - (y // 50)
         col = x // 50
         return chess.square(col, row)
+    
+    def automated_move(self):
+        if self.is_training_mode and not self.board.is_game_over(claim_draw=True) and self.game_in_progress:
+            # Get the current board state as an image
+            board_image = self.capture_board_state_as_image()
 
+            # Get the neural network's predicted move for the current player
+            nn_move = self.get_nn_move(board_image)
+
+            # Make the move if it's legal
+            if nn_move in self.board.legal_moves:
+                self.board.push(nn_move)
+            else:
+                # If the predicted move is not legal, choose a random legal move
+                self.board.push(random.choice(list(self.board.legal_moves)))
+
+            self.update_board()
+
+            # Schedule the next move
+            self.master.after(500, self.automated_move)  # 500 ms delay between moves
+        else:
+            self.game_over()  # Handle the game over scenario
+
+    def restart_game(self):
+        # Your existing restart_game logic...
+        if self.games_played >= 10:
+            self.is_training_mode = False
+            self.game_in_progress = False  # Stop the game
+            self.games_played = 0  # Reset the games played counter
+            print("Completed 10 games in automated training mode. Exiting training mode.")
+        else:
+            # Start a new game immediately without waiting
+            self.board.reset()
+            self.update_board()
+            self.moves_data.clear()  # Clear the moves data for the new game
+            self.games_played += 1  # Increment the games played counter
+            self.automated_move()  # Start the next game immediately
+
+    # Modify the game_over method
     def game_over(self):
-        outcome = self.check_end_condition()
+        if not self.is_training_mode:
+            outcome = self.check_end_condition()
 
-        # Label all moves based on game outcome
-        for move_data in self.moves_data:
-            move_data['label'] = outcome
+            # Label all moves based on game outcome
+            for move_data in self.moves_data:
+                move_data['label'] = outcome
 
-        # Save the game data to the dataset
-        self.save_dataset()
-
-        messagebox.showinfo("Game Over", "The game is over. Outcome: " + outcome)
+            # Save the game data to the dataset
+            self.save_dataset()
+            self.restart_game()
+        else:
+            # In training mode, just restart the game without showing any alerts
+            self.restart_game()
+            pass
 
     def check_end_condition(self):
         if self.board.is_checkmate():
