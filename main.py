@@ -1,10 +1,10 @@
-from tkinter import simpledialog, messagebox
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from tkinter import messagebox
+from PIL import Image, ImageTk, ImageDraw
 from wand.image import Image as WandImage
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from torchvision import transforms
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 import chess, os, io, random, queue, threading, torch, time
 import chess.svg
 import pandas as pd
@@ -13,6 +13,7 @@ import torch.nn as nn
 import numpy as np
 import torch.optim as optim
 import torch.nn.functional as F
+import sklearn.metrics as metrics
 
 # Constants
 DATASET_PATH = 'chess_dataset.csv'
@@ -21,12 +22,11 @@ IMAGE_SIZE = (128, 128)
 MAX_ENCODED_MOVE = 4096  # Define this constant at the top level
 MIN_MOVES_FOR_TRAINING = 100
 
-# Transformation pipeline for image preprocessing
+# Updated transformation pipeline to ensure 3-channel input
 transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize for 3 channels
 ])
 
 # Chess Dataset with Preprocessing and Augmentation
@@ -34,6 +34,16 @@ class ChessDataset(Dataset):
     def __init__(self, csv_file, transform=None):
         self.data_frame = pd.read_csv(csv_file)
         self.transform = transform
+
+    def augment_image(self, image):
+        # Randomly choose to apply transformations
+        if random.choice([True, False]):
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)  # Flip image
+        
+        if random.choice([True, False]):
+            image = image.rotate(90)  # Rotate image
+
+        return image
 
     def __len__(self):
         return len(self.data_frame)
@@ -44,20 +54,54 @@ class ChessDataset(Dataset):
         move_encoded = self.encode_move(move_str)
         move_tensor = torch.tensor(move_encoded, dtype=torch.long)
 
-        image = self.fen_to_image(fen)
+        image = self.fen_to_image_enhanced(fen)
         if self.transform:
             image = self.transform(image)
 
         return image, move_tensor
     
     def encode_move(self, move):
-        # Assuming each square on the chessboard is assigned a unique number from 0-63
-        # e.g., "a1" -> 0, "b1" -> 1, ..., "h8" -> 63
+        # Example: Adding simple logic to include promotion in encoding
+        # This is a basic example; consider expanding further for all move types
         from_square = (ord(move[0]) - ord('a')) + 8 * (int(move[1]) - 1)
         to_square = (ord(move[2]) - ord('a')) + 8 * (int(move[3]) - 1)
-        return from_square * 64 + to_square
+        encoded_move = from_square * 64 + to_square
 
-    def fen_to_image(self, fen, square_size=60):
+        if len(move) == 5:  # Promotion move
+            # Simple encoding for promotion piece. 'q' -> 1, 'r' -> 2, 'b' -> 3, 'n' -> 4
+            promotion_piece = {'q': 1, 'r': 2, 'b': 3, 'n': 4}.get(move[4], 0)
+            encoded_move = encoded_move * 10 + promotion_piece
+
+        # Ensure the encoded move is within the range
+        encoded_move = min(encoded_move, MAX_ENCODED_MOVE - 1)
+
+        return encoded_move
+
+    def fen_to_image_enhanced(self, fen):
+        board = chess.Board(fen)
+        # Initialize a 8x8x3 array to represent the board in 3 channels
+        array = np.zeros((8, 8, 3), dtype=np.float32)
+        
+        # Mapping of pieces to channels
+        piece_to_channel = {
+            'P': 0,  # Pawns in channel 0
+            'N': 1, 'B': 1,  # Knights and Bishops in channel 1
+            'R': 2, 'Q': 2, 'K': 2,  # Rooks, Queens, and Kings in channel 2
+            'p': 0,  # Black pawns in channel 0 (negative values)
+            'n': 1, 'b': 1,  # Black knights and bishops in channel 1 (negative values)
+            'r': 2, 'q': 2, 'k': 2   # Black rooks, queens, and kings in channel 2 (negative values)
+        }
+
+        for square, piece in board.piece_map().items():
+            rank, file = divmod(square, 8)
+            channel = piece_to_channel[str(piece)]
+            array[rank, file, channel] = 1 if piece.color else -1  # Positive for white, negative for black
+
+        # Convert the array to an image
+        image = Image.fromarray(np.uint8((array + 1) / 2 * 255), 'RGB')  # Normalize and convert to RGB image
+        return image
+
+    def fen_to_image(self, fen, square_size=60, augment=False):
         board = chess.Board(fen)
         img_size = square_size * 8
         image = Image.new("RGB", (img_size, img_size), "white")
@@ -78,30 +122,41 @@ class ChessDataset(Dataset):
                 x = chess.square_file(square)
                 y = 7 - chess.square_rank(square)
                 draw.text((x * square_size + square_size // 4, y * square_size), symbol, fill="black")
-
+        
+        if augment and random.choice([True, False]):
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
         return image
 
     def draw_square(self, draw, color, x, y, square_size):
         draw.rectangle([x * square_size, y * square_size, (x + 1) * square_size, (y + 1) * square_size], fill=color)
 
-# Model Definition with Softmax Activation
+# Updated ChessCNN Model
 class ChessCNN(nn.Module):
     def __init__(self):
         super(ChessCNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.dropout2 = nn.Dropout(0.25)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2)
-        self.fc1 = nn.Linear(32 * IMAGE_SIZE[0]//4 * IMAGE_SIZE[1]//4, 512)
-        self.fc2 = nn.Linear(512, 128)
-        self.fc3 = nn.Linear(128, MAX_ENCODED_MOVE)  # Now MAX_ENCODED_MOVE is recognized
+        # Adjusted the input features of self.fc1 to 262144
+        self.fc1 = nn.Linear(262144, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, MAX_ENCODED_MOVE)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
+        x = F.relu(self.conv1(x))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 32 * IMAGE_SIZE[0]//4 * IMAGE_SIZE[1]//4)
+        x = self.dropout1(x)
+        x = F.relu(self.conv3(x))
+        x = self.pool(F.relu(self.conv4(x)))
+        x = self.dropout2(x)
+        x = x.view(x.size(0), -1)  # Ensure flattening maintains the batch size
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = self.fc3(x)  # No softmax here, since nn.CrossEntropyLoss will be used
+        x = self.fc3(x)
         return x
 
 class ChessGUI:
@@ -122,7 +177,6 @@ class ChessGUI:
         self.model = ChessCNN().to(self.device)
         self.load_model()
         self.update_board()  # Now safe to call as is_training_mode is initialized
-        self.automated_game_thread = None  # Add this line to initialize the automated game thread
         self.games_played = 0  # Initialize a counter to track the number of games played in automated mode
         self.game_in_progress = False
 
@@ -138,7 +192,16 @@ class ChessGUI:
 
     def make_move(self, from_square, to_square):
         try:
-            move = chess.Move(from_square=from_square, to_square=to_square)
+            # Check if the move is a pawn promotion (pawn reaches the last rank)
+            promotion = None
+            moving_piece = self.board.piece_at(from_square)
+            if moving_piece and moving_piece.piece_type == chess.PAWN:
+                if to_square in chess.SquareSet(chess.BB_RANK_1 | chess.BB_RANK_8):
+                    # Promote to a queen by default
+                    promotion = chess.QUEEN
+
+            move = chess.Move(from_square=from_square, to_square=to_square, promotion=promotion)
+
             if move in self.board.legal_moves:
                 self.board.push(move)
                 self.update_board()
@@ -153,7 +216,7 @@ class ChessGUI:
                 })
 
                 # Only make an AI move if it's AI's turn and not in training mode
-                if not self.is_training_mode and not self.board.turn:  # Adjusted logic here
+                if not self.is_training_mode and not self.board.turn:
                     self.master.after(1000, self.make_ai_move)
 
             else:
@@ -180,10 +243,7 @@ class ChessGUI:
             self.update_board()  # Update the board to reflect the move.
         else:
             # Log an error or handle the case where an invalid or illegal move was generated.
-            print("AI generated an invalid move or tried to move an opponent's piece.")
-
-    def start_cnn_thread(self):
-        threading.Thread(target=self.cnn_predict_move, daemon=True).start()
+            print("AI generated an invalid move or tried to move an opponent")
 
     def cnn_predict_move(self):
         while True:
@@ -223,14 +283,10 @@ class ChessGUI:
 
         return selected_move
 
-    def square_to_uci(self, square):
-        # Convert a square index to UCI format (e.g., index 0 -> 'a1')
-        row = square % 8
-        col = square // 8
-        return f"{chr(ord('a') + col)}{row + 1}"
-
     def pil_to_tensor(self, image):
-        # Convert a PIL Image to a PyTorch tensor using the transformation pipeline
+        # Ensure image is in RGB format
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         image_tensor = self.transform(image)
         return image_tensor
 
@@ -252,36 +308,25 @@ class ChessGUI:
         self.training_thread.daemon = True
         self.training_thread.start()
 
+    
     def train_model_background(self, model, device, train_loader, test_loader, num_epochs):
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
         for epoch in range(num_epochs):
             model.train()
-            for images, moves in train_loader:  # Directly unpack the batch
-                images = images.to(device)  # Move images to the correct device
-                moves = moves.to(device)  # Move moves to the correct device
-
+            for images, moves in train_loader:
+                images = images.to(device)
+                moves = moves.to(device)
                 optimizer.zero_grad()
                 outputs = model(images)
-                loss = criterion(outputs, moves)
+                loss = criterion(outputs, moves)  # 'moves' should be a tensor of integers representing the move indexes
                 loss.backward()
                 optimizer.step()
 
             # Validation Phase
-            model.eval()
-            with torch.no_grad():
-                correct = 0
-                total = 0
-                for images, moves in test_loader:
-                    images = images.to(device)
-                    moves = moves.to(device)
-                    outputs = model(images)
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += moves.size(0)
-                    correct += (predicted == moves).sum().item()
-
-            print(f'Epoch {epoch+1}, Loss: {loss.item():.4f}, Validation Accuracy: {100 * correct / total:.2f}%')
+            evaluate_model(model, test_loader, device, epoch)  # Pass epoch to evaluate_model function
 
         # After training, save the model
         torch.save(model.state_dict(), MODEL_FILE_PATH)
@@ -294,9 +339,17 @@ class ChessGUI:
         self.training_button.config(text="Stop Training")
         self.board.reset()
         self.is_training_mode = True
-        self.start_training_thread()  # Start training in a separate thread
+
+        # Prepare data loaders before starting the training thread
+        train_loader, test_loader = self.prepare_data_loaders()
+        self.start_training_thread(train_loader, test_loader)
+
         self.game_in_progress = True
         self.automated_move()  # Start the first move without waiting
+
+    def prepare_data_loaders(self):
+        # Assuming you have a function to load data
+        return load_data(DATASET_PATH)
 
     def automated_game(self):
         while self.is_training_mode and not self.board.is_game_over(claim_draw=True):
@@ -480,27 +533,79 @@ class ChessGUI:
         else:
             return 'unknown'
 
-    def save_dataset(self):
-        df = pd.DataFrame(self.moves_data)
-        if os.path.exists(DATASET_PATH):
-            df.to_csv(DATASET_PATH, mode='a', header=False, index=False)
-        else:
-            df.to_csv(DATASET_PATH, index=False)
-
-        self.check_dataset_availability()  # Check if training mode should be enabled
-
     def check_dataset_availability(self):
-        if os.path.exists(DATASET_PATH):
-            # Read the dataset to check its length
-            df = pd.read_csv(DATASET_PATH)
-            if len(df) >= MIN_MOVES_FOR_TRAINING:  # Check if there are enough moves for training
-                self.training_button.config(state=tk.NORMAL)
-            else:
-                self.training_button.config(state=tk.DISABLED)
-                messagebox.showinfo("Training Mode", f"Training requires at least {MIN_MOVES_FOR_TRAINING} moves. Current dataset contains only {len(df)} moves.")
+        if not os.path.exists(DATASET_PATH) or pd.read_csv(DATASET_PATH).shape[0] < MIN_MOVES_FOR_TRAINING:
+            print("No sufficient dataset found. Starting automated data generation...")
+            self.automated_data_generation()
         else:
-            self.training_button.config(state=tk.DISABLED)
-            messagebox.showinfo("Training Mode", "No dataset found. Please create a dataset for training.")
+            self.training_button.config(state=tk.NORMAL)
+            
+    def automated_data_generation(self):
+        # Create a new thread for automated data generation
+        threading.Thread(target=self.generate_data, daemon=True).start()
+    
+    def generate_data(self):
+        move_data = []
+        while len(move_data) < MIN_MOVES_FOR_TRAINING:
+            board = chess.Board()
+            while not board.is_game_over(claim_draw=True):
+                move = random.choice(list(board.legal_moves))
+                board.push(move)
+                move_data.append({
+                    'fen_before_move': board.fen(),
+                    'move': move.uci()
+                })
+            print(f"Generated {len(move_data)} moves")
+
+        # Save the generated data
+        df = pd.DataFrame(move_data)
+        df.to_csv(DATASET_PATH, index=False)
+        print(f"Saved generated data to {DATASET_PATH}")
+
+        # Start training in the background
+        self.start_background_training()
+
+    def start_background_training(self):
+        print("Starting training in the background...")
+        # Your training setup code here
+        train_loader, test_loader = load_data(DATASET_PATH)
+        self.start_training_thread(train_loader, test_loader)
+
+    def start_training_thread(self, train_loader, test_loader):
+        # Define the number of epochs for training
+        num_epochs = 10
+        
+        # Start the training thread and pass the required arguments
+        self.training_thread = threading.Thread(target=self.train_model_background,
+                                                args=(self.model, self.device, train_loader, test_loader, num_epochs))
+        self.training_thread.daemon = True
+        self.training_thread.start()
+    
+    def save_dataset(self):
+        if self.moves_data:
+            df = pd.DataFrame(self.moves_data)
+            # Append data to the CSV file, change 'a' to 'w' if you want to overwrite each time
+            df.to_csv(DATASET_PATH, mode='a', header=not os.path.exists(DATASET_PATH), index=False)
+            print("Game data saved to dataset.")
+
+def evaluate_model(model, test_loader, device, epoch):
+    model.eval()
+    correct_top1 = 0
+    correct_top5 = 0
+    total = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted_top1 = torch.max(outputs, 1)
+            _, predicted_top5 = outputs.topk(5, dim=1)
+            
+            total += labels.size(0)
+            correct_top1 += (predicted_top1 == labels).sum().item()
+            correct_top5 += sum([labels[i] in predicted_top5[i] for i in range(len(labels))])
+    
+    print(f'Epoch {epoch + 1}, Top-1 Accuracy: {100 * correct_top1 / total:.2f}%, Top-5 Accuracy: {100 * correct_top5 / total:.2f}%')
 
 # Data Preparation
 def load_data(csv_file):
@@ -510,11 +615,14 @@ def load_data(csv_file):
     test_loader = DataLoader(test_set, batch_size=64)
     return train_loader, test_loader
 
-# Training and Validation
+# Updated Training Function
 def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+
     for epoch in range(num_epochs):
         model.train()
+        running_loss = 0.0
         for images, moves in train_loader:
             images, moves = images.to(device), moves.to(device)
             optimizer.zero_grad()
@@ -522,8 +630,12 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
             loss = criterion(outputs, moves)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item()
 
-        # Validation Phase
+        scheduler.step()
+        print(f'Epoch {epoch+1}, Loss: {running_loss/len(train_loader)}')
+
+        # Validation phase
         model.eval()
         with torch.no_grad():
             correct = 0
@@ -535,22 +647,27 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
                 total += moves.size(0)
                 correct += (predicted == moves).sum().item()
 
-            print(f'Epoch {epoch+1}, Loss: {loss.item():.4f}, Validation Accuracy: {100 * correct / total:.2f}%')
+            print(f'Validation Accuracy: {100 * correct / total:.2f}%')
 
+# Main function
 def main():
+    # Initialize Tkinter GUI
     root = tk.Tk()
     gui = ChessGUI(root, transform=transform)
     root.mainloop()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prepare data loaders
     train_loader, test_loader = load_data(DATASET_PATH)
 
+    # Initialize model and optimizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ChessCNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # Pass both train_loader and test_loader to the train_model function
+    # Train the model
     train_model(model, device, train_loader, test_loader, optimizer)
 
+    # Save the trained model
     torch.save(model.state_dict(), MODEL_FILE_PATH)
     print(f'Model saved to {MODEL_FILE_PATH}')
 
