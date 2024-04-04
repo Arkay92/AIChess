@@ -14,6 +14,7 @@ import numpy as np
 import torch.optim as optim
 import torch.nn.functional as F
 import sklearn.metrics as metrics
+import torch.quantization
 
 # Constants
 DATASET_PATH = 'chess_dataset.csv'
@@ -36,13 +37,15 @@ class ChessDataset(Dataset):
         self.transform = transform
 
     def augment_image(self, image):
-        # Randomly choose to apply transformations
+        # Extended augmentation
         if random.choice([True, False]):
-            image = image.transpose(Image.FLIP_LEFT_RIGHT)  # Flip image
-        
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
         if random.choice([True, False]):
-            image = image.rotate(90)  # Rotate image
-
+            image = image.rotate(random.choice([90, 180, 270]))
+        if random.choice([True, False]):
+            enhancer = ImageEnhance.Brightness(image)
+            image = enhancer.enhance(random.uniform(0.7, 1.3))
+        # Add more augmentation techniques if needed
         return image
 
     def __len__(self):
@@ -134,29 +137,46 @@ class ChessDataset(Dataset):
 class ChessCNN(nn.Module):
     def __init__(self):
         super(ChessCNN, self).__init__()
+        self.quant = torch.quantization.QuantStub()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
         self.dropout1 = nn.Dropout(0.25)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
         self.dropout2 = nn.Dropout(0.25)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-        # Adjusted the input features of self.fc1 to 262144
-        self.fc1 = nn.Linear(262144, 1024)
+        self.fc1 = nn.Linear(256 * 32 * 32, 1024)  # Adjusted based on the output size of conv4
         self.fc2 = nn.Linear(1024, 512)
         self.fc3 = nn.Linear(512, MAX_ENCODED_MOVE)
+        self.dequant = torch.quantization.DeQuantStub()  # Dequantization stub for the output
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool(F.relu(self.conv2(x)))
+        x = self.quant(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
         x = self.dropout1(x)
         x = F.relu(self.conv3(x))
         x = self.pool(F.relu(self.conv4(x)))
         x = self.dropout2(x)
-        x = x.view(x.size(0), -1)  # Ensure flattening maintains the batch size
+        x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
+        x = self.dequant(x)  # Dequantize the output
+        return x
+
+class QuantizedChessCNN(ChessCNN):
+    def __init__(self):
+        super(QuantizedChessCNN, self).__init__()
+        self.quant = torch.quantization.QuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
+
+    def forward(self, x):
+        x = self.quant(x)
+        x = super().forward(x)
+        x = self.dequant(x)
         return x
 
 class ChessGUI:
@@ -309,10 +329,13 @@ class ChessGUI:
         self.training_thread.start()
 
     
+    # In train_model_background
     def train_model_background(self, model, device, train_loader, test_loader, num_epochs):
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
         criterion = nn.CrossEntropyLoss()
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.1)
+        early_stopping_counter = 0
+        min_val_loss = float('inf')
 
         for epoch in range(num_epochs):
             model.train()
@@ -321,12 +344,33 @@ class ChessGUI:
                 moves = moves.to(device)
                 optimizer.zero_grad()
                 outputs = model(images)
-                loss = criterion(outputs, moves)  # 'moves' should be a tensor of integers representing the move indexes
+                loss = criterion(outputs, moves)
                 loss.backward()
                 optimizer.step()
 
             # Validation Phase
-            evaluate_model(model, test_loader, device, epoch)  # Pass epoch to evaluate_model function
+            val_loss = 0
+            with torch.no_grad():
+                model.eval()
+                for images, moves in test_loader:
+                    images = images.to(device)
+                    moves = moves.to(device)
+                    outputs = model(images)
+                    batch_loss = criterion(outputs, moves)
+                    val_loss += batch_loss.item()
+
+            val_loss /= len(test_loader)
+            print(f'Epoch {epoch + 1}, Validation Loss: {val_loss:.4f}')
+            
+            scheduler.step(val_loss)
+            if val_loss < min_val_loss:
+                min_val_loss = val_loss
+                early_stopping_counter = 0  # Reset counter if validation loss improves
+            else:
+                early_stopping_counter += 1  # Increment counter if no improvement
+                if early_stopping_counter > 5:  # Stop if no improvement for 6 consecutive epochs
+                    print("Early stopping triggered")
+                    break
 
         # After training, save the model
         torch.save(model.state_dict(), MODEL_FILE_PATH)
@@ -588,6 +632,21 @@ class ChessGUI:
             df.to_csv(DATASET_PATH, mode='a', header=not os.path.exists(DATASET_PATH), index=False)
             print("Game data saved to dataset.")
 
+def prepare_for_quantization(model, device, data_loader):
+    model.eval()
+    model.fuse_model()  # Fuse Conv+BN+ReLU layers before quantization, if your model has such sequences
+    model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+    torch.quantization.prepare(model, inplace=True)
+
+    # Calibrate the model with representative data
+    with torch.no_grad():
+        for images, _ in data_loader:
+            images = images.to(device)
+            model(images)
+
+    quantized_model = torch.quantization.convert(model, inplace=True)
+    return quantized_model
+
 def evaluate_model(model, test_loader, device, epoch):
     model.eval()
     correct_top1 = 0
@@ -651,7 +710,6 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
 
 # Main function
 def main():
-    # Initialize Tkinter GUI
     root = tk.Tk()
     gui = ChessGUI(root, transform=transform)
     root.mainloop()
@@ -659,17 +717,17 @@ def main():
     # Prepare data loaders
     train_loader, test_loader = load_data(DATASET_PATH)
 
-    # Initialize model and optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ChessCNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    # Train the model
-    train_model(model, device, train_loader, test_loader, optimizer)
-
-    # Save the trained model
-    torch.save(model.state_dict(), MODEL_FILE_PATH)
-    print(f'Model saved to {MODEL_FILE_PATH}')
+    model = QuantizedChessCNN().to(device)
+    if os.path.exists(MODEL_FILE_PATH):
+        state_dict = torch.load(MODEL_FILE_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        model_fp = ChessCNN()
+        model_fp.load_state_dict(torch.load(MODEL_FILE_PATH, map_location=device))
+        model_fp.to(device)
+        quantized_model = prepare_for_quantization(model_fp, device, train_loader)
+        torch.save(quantized_model.state_dict(), MODEL_FILE_PATH)
 
 if __name__ == "__main__":
     main()
