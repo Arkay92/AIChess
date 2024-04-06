@@ -1,9 +1,9 @@
 from tkinter import messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageEnhance
 from wand.image import Image as WandImage
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from torchvision import transforms
+from torchvision import transforms, models
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 import chess, os, io, random, queue, threading, torch, time
 import chess.svg
@@ -15,19 +15,27 @@ import torch.optim as optim
 import torch.nn.functional as F
 import sklearn.metrics as metrics
 import torch.quantization
+from torchvision.models import resnet18, ResNet18_Weights
+
 
 # Constants
 DATASET_PATH = 'chess_dataset.csv'
 MODEL_FILE_PATH = 'chess_cnn_model.pth'
-IMAGE_SIZE = (128, 128)
-MAX_ENCODED_MOVE = 4096  # Define this constant at the top level
+IMAGE_SIZE = 128
+BATCH_SIZE = 64
+NUM_WORKERS = 4
+NUM_EPOCHS = 10
+NUM_CLASSES = 4096
+MAX_ENCODED_MOVE = 4096
 MIN_MOVES_FOR_TRAINING = 100
 
-# Updated transformation pipeline to ensure 3-channel input
+# Transformation pipeline with advanced augmentations
 transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize for 3 channels
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
 # Chess Dataset with Preprocessing and Augmentation
@@ -60,48 +68,34 @@ class ChessDataset(Dataset):
         image = self.fen_to_image_enhanced(fen)
         if self.transform:
             image = self.transform(image)
-
         return image, move_tensor
     
     def encode_move(self, move):
-        # Example: Adding simple logic to include promotion in encoding
-        # This is a basic example; consider expanding further for all move types
         from_square = (ord(move[0]) - ord('a')) + 8 * (int(move[1]) - 1)
         to_square = (ord(move[2]) - ord('a')) + 8 * (int(move[3]) - 1)
         encoded_move = from_square * 64 + to_square
 
         if len(move) == 5:  # Promotion move
-            # Simple encoding for promotion piece. 'q' -> 1, 'r' -> 2, 'b' -> 3, 'n' -> 4
             promotion_piece = {'q': 1, 'r': 2, 'b': 3, 'n': 4}.get(move[4], 0)
             encoded_move = encoded_move * 10 + promotion_piece
 
-        # Ensure the encoded move is within the range
-        encoded_move = min(encoded_move, MAX_ENCODED_MOVE - 1)
-
-        return encoded_move
+        return min(encoded_move, MAX_ENCODED_MOVE - 1)
 
     def fen_to_image_enhanced(self, fen):
         board = chess.Board(fen)
-        # Initialize a 8x8x3 array to represent the board in 3 channels
         array = np.zeros((8, 8, 3), dtype=np.float32)
         
-        # Mapping of pieces to channels
         piece_to_channel = {
-            'P': 0,  # Pawns in channel 0
-            'N': 1, 'B': 1,  # Knights and Bishops in channel 1
-            'R': 2, 'Q': 2, 'K': 2,  # Rooks, Queens, and Kings in channel 2
-            'p': 0,  # Black pawns in channel 0 (negative values)
-            'n': 1, 'b': 1,  # Black knights and bishops in channel 1 (negative values)
-            'r': 2, 'q': 2, 'k': 2   # Black rooks, queens, and kings in channel 2 (negative values)
+            'P': 0, 'N': 1, 'B': 1, 'R': 2, 'Q': 2, 'K': 2,
+            'p': 0, 'n': 1, 'b': 1, 'r': 2, 'q': 2, 'k': 2
         }
 
         for square, piece in board.piece_map().items():
             rank, file = divmod(square, 8)
             channel = piece_to_channel[str(piece)]
-            array[rank, file, channel] = 1 if piece.color else -1  # Positive for white, negative for black
+            array[rank, file, channel] = 1 if piece.color else -1
 
-        # Convert the array to an image
-        image = Image.fromarray(np.uint8((array + 1) / 2 * 255), 'RGB')  # Normalize and convert to RGB image
+        image = Image.fromarray(np.uint8((array + 1) / 2 * 255), 'RGB')
         return image
 
     def fen_to_image(self, fen, square_size=60, augment=False):
@@ -137,34 +131,18 @@ class ChessDataset(Dataset):
 class ChessCNN(nn.Module):
     def __init__(self):
         super(ChessCNN, self).__init__()
-        self.quant = torch.quantization.QuantStub()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.dropout1 = nn.Dropout(0.25)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.dropout2 = nn.Dropout(0.25)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-        self.fc1 = nn.Linear(256 * 32 * 32, 1024)  # Adjusted based on the output size of conv4
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, MAX_ENCODED_MOVE)
-        self.dequant = torch.quantization.DeQuantStub()  # Dequantization stub for the output
+        self.fc1 = nn.Linear(32 * (IMAGE_SIZE // 2) * (IMAGE_SIZE // 2), 512)
+        self.fc2 = nn.Linear(512, NUM_CLASSES)
 
     def forward(self, x):
-        x = self.quant(x)
         x = F.relu(self.bn1(self.conv1(x)))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.dropout1(x)
-        x = F.relu(self.conv3(x))
-        x = self.pool(F.relu(self.conv4(x)))
-        x = self.dropout2(x)
+        x = self.pool(x)
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        x = self.dequant(x)  # Dequantize the output
+        x = self.fc2(x)
         return x
 
 class QuantizedChessCNN(ChessCNN):
@@ -206,9 +184,31 @@ class ChessGUI:
         else:
             self.enter_training_mode()
 
+    # Updated load_model method in ChessGUI class to handle quantized models
     def load_model(self):
         if os.path.exists(MODEL_FILE_PATH):
-            self.model.load_state_dict(torch.load(MODEL_FILE_PATH, map_location=self.device))
+            # Load the state_dict to check if it's quantized
+            state_dict = torch.load(MODEL_FILE_PATH, map_location=self.device)
+            is_quantized = any('quant' in key for key in state_dict)
+
+            if is_quantized:
+                # Initialize the quantized model structure if the loaded model is quantized
+                self.model = QuantizedChessCNN().to(self.device)
+                # Prepare the model for quantization to match the expected state dict structure
+                self.model.eval()
+                self.model.fuse_model()  # Fuse the model if you have convolutional layers followed by batchnorm and relu
+                self.model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+                torch.quantization.prepare(self.model, inplace=True)
+                torch.quantization.convert(self.model, inplace=True)
+            else:
+                # Initialize the standard model structure if the loaded model is not quantized
+                self.model = ChessCNN().to(self.device)
+
+            # Load the state_dict into the initialized model structure
+            self.model.load_state_dict(state_dict)
+        else:
+            # If no model is found, initialize the standard model structure
+            self.model = ChessCNN().to(self.device)
 
     def make_move(self, from_square, to_square):
         try:
@@ -331,6 +331,7 @@ class ChessGUI:
     
     # In train_model_background
     def train_model_background(self, model, device, train_loader, test_loader, num_epochs):
+        torch.autograd.set_detect_anomaly(True)
         optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
         criterion = nn.CrossEntropyLoss()
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.1)
@@ -633,19 +634,20 @@ class ChessGUI:
             print("Game data saved to dataset.")
 
 def prepare_for_quantization(model, device, data_loader):
+    model.to(device)
     model.eval()
-    model.fuse_model()  # Fuse Conv+BN+ReLU layers before quantization, if your model has such sequences
+
     model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
     torch.quantization.prepare(model, inplace=True)
 
-    # Calibrate the model with representative data
     with torch.no_grad():
         for images, _ in data_loader:
             images = images.to(device)
             model(images)
 
-    quantized_model = torch.quantization.convert(model, inplace=True)
-    return quantized_model
+    model.to('cpu')
+    torch.quantization.convert(model, inplace=True)
+    return model
 
 def evaluate_model(model, test_loader, device, epoch):
     model.eval()
@@ -670,8 +672,8 @@ def evaluate_model(model, test_loader, device, epoch):
 def load_data(csv_file):
     dataset = ChessDataset(csv_file=csv_file, transform=transform)
     train_set, test_set = train_test_split(dataset, test_size=0.2, random_state=42)
-    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_set, batch_size=64)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE)
     return train_loader, test_loader
 
 # Updated Training Function
@@ -694,7 +696,6 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
         scheduler.step()
         print(f'Epoch {epoch+1}, Loss: {running_loss/len(train_loader)}')
 
-        # Validation phase
         model.eval()
         with torch.no_grad():
             correct = 0
@@ -708,26 +709,36 @@ def train_model(model, device, train_loader, test_loader, optimizer, num_epochs=
 
             print(f'Validation Accuracy: {100 * correct / total:.2f}%')
 
-# Main function
+# Updating the main function to ensure proper model quantization
 def main():
     root = tk.Tk()
     gui = ChessGUI(root, transform=transform)
     root.mainloop()
 
-    # Prepare data loaders
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = load_data(DATASET_PATH)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = QuantizedChessCNN().to(device)
+    # Initialize a standard model for training or a pre-trained model
+    model = ChessCNN().to(device)
+    
+    # Check if a model file already exists
     if os.path.exists(MODEL_FILE_PATH):
-        state_dict = torch.load(MODEL_FILE_PATH, map_location=device)
-        model.load_state_dict(state_dict)
+        # Load the existing model
+        gui.load_model()  # Utilize the updated load_model method
+        model = gui.model
     else:
-        model_fp = ChessCNN()
-        model_fp.load_state_dict(torch.load(MODEL_FILE_PATH, map_location=device))
-        model_fp.to(device)
-        quantized_model = prepare_for_quantization(model_fp, device, train_loader)
-        torch.save(quantized_model.state_dict(), MODEL_FILE_PATH)
+        # Train a new model if none exists
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        train_model(model, device, train_loader, test_loader, optimizer, NUM_EPOCHS)
+        torch.save(model.state_dict(), MODEL_FILE_PATH)
+
+        # Prepare the trained model for quantization
+        model.eval()
+        model.fuse_model()  # Fuse the model if you have convolutional layers followed by batchnorm and relu
+        model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+        torch.quantization.prepare(model, inplace=True)
+        torch.quantization.convert(model, inplace=True)
+        torch.save(model.state_dict(), MODEL_FILE_PATH)
 
 if __name__ == "__main__":
     main()
